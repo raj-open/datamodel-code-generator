@@ -329,6 +329,7 @@ class DataType(_BaseModel):
     strict: bool = False
     dict_key: Optional[DataType] = None  # noqa: UP045
     treat_dot_as_module: bool = False
+    ancestors: list[str] | None = None
 
     _exclude_fields: ClassVar[set[str]] = {"parent", "children"}
     _pass_fields: ClassVar[set[str]] = {"parent", "children", "data_types", "reference"}
@@ -345,6 +346,7 @@ class DataType(_BaseModel):
         is_custom_type: bool = False,
         strict: bool = False,
         kwargs: dict[str, Any] | None = None,
+        ancestors: list[str] | None = None,
     ) -> DataTypeT:
         """Create a DataType from an Import object."""
         return cls(
@@ -358,6 +360,7 @@ class DataType(_BaseModel):
             is_custom_type=is_custom_type,
             strict=strict,
             kwargs=kwargs,
+            ancestors=ancestors,
         )
 
     @property
@@ -478,84 +481,171 @@ class DataType(_BaseModel):
             self.reference.children.append(self)
 
     @property
-    def type_hint(self) -> str:  # noqa: PLR0912, PLR0915
+    def type_hint(self) -> str:
         """Generate the Python type hint string for this DataType."""
-        type_: str | None = self.alias or self.type
-        if not type_:
-            if self.is_union:
-                data_types: list[str] = []
-                for data_type in self.data_types:
-                    data_type_type = data_type.type_hint
-                    if data_type_type in data_types:  # pragma: no cover
-                        continue
+        context = self
+        return context.determine_type_hint(self)
 
-                    if data_type_type == NONE:
-                        self.is_optional = True
-                        continue
+    def determine_type_hint(self, t: DataType, /) -> str:
+        """Given a fixed datatype as context determines the type hint
+        of a possibly different data type recursively whilst retaining the context.
+        """
+        hint = self.determine_type_hint_basic(t)
+        hint = self.determine_type_hint_composition(t, hint)
+        if t.is_optional and hint != ANY:
+            hint = get_optional_type(hint, t.use_union_operator)
+        return hint
 
-                    non_optional_data_type_type = _remove_none_from_union(
-                        data_type_type, use_union_operator=self.use_union_operator
-                    )
+    def determine_type_hints(self, t: DataType, /) -> list[str]:
+        """Determines type hints for all subtypes."""
+        hints = []
+        for type_child in t.data_types:
+            hint_child = self.determine_type_hint(type_child)
+            if hint_child == NONE:
+                t.is_optional = True
+                continue
 
-                    if non_optional_data_type_type != data_type_type:
-                        self.is_optional = True
+            hint_child_ = hint_child
+            hint_child = _remove_none_from_union(hint_child_, use_union_operator=t.use_union_operator)
+            if hint_child != hint_child_:
+                t.is_optional = True
 
-                    data_types.append(non_optional_data_type_type)
-                if len(data_types) == 1:
-                    type_ = data_types[0]
-                elif self.use_union_operator:
-                    type_ = UNION_OPERATOR_DELIMITER.join(data_types)
-                else:
-                    type_ = f"{UNION_PREFIX}{UNION_DELIMITER.join(data_types)}]"
-            elif len(self.data_types) == 1:
-                type_ = self.data_types[0].type_hint
-            elif self.literals:
-                type_ = f"{LITERAL}[{', '.join(repr(literal) for literal in self.literals)}]"
-            elif self.reference:
-                type_ = self.reference.short_name
-            else:
-                # TODO support strict Any
-                type_ = ""
-        if self.reference:
-            source = self.reference.source
+            if hint_child in hints:
+                continue
+
+            hints.append(hint_child)
+        return hints
+
+    def determine_type_hint_basic(self, t: DataType, /) -> str:  # pragma: nocover
+        """Resolve the basic part of the type hint."""
+        if (hint := t.alias) is not None:
+            return hint
+
+        if (hint := t.type) is not None:
+            return hint
+
+        if t.is_union:
+            hints = self.determine_type_hints(t)
+            if len(hints) == 1:
+                return hints[0]
+
+            if t.use_union_operator:
+                return UNION_OPERATOR_DELIMITER.join(hints)
+
+            return f"{UNION_PREFIX}{UNION_DELIMITER.join(hints)}]"
+
+        if len(t.data_types) == 1:
+            t = t.data_types[0]
+            return self.determine_type_hint(t)
+
+        if t.literals:
+            return f"{LITERAL}[{', '.join(repr(literal) for literal in t.literals)}]"
+
+        if t.reference:
+            hint = t.reference.short_name
+            # cf. PEP 484: "Forward references must be quoted"
+            # NOTE: here we use 'self' as the overarching context
+            if hint not in (self.ancestors or []):
+                hint = f'"{hint}"'
+
+            return hint
+
+        # TODO: support strict Any
+        return ""
+
+    def determine_type_hint_composition(
+        self,
+        t: DataType,
+        hint: str,
+        /,
+    ) -> str:
+        if t.reference:
+            source = t.reference.source
             if isinstance(source, Nullable) and source.nullable:
-                self.is_optional = True
-        if self.is_list:
-            if self.use_generic_container:
-                list_ = SEQUENCE
-            elif self.use_standard_collections:
-                list_ = STANDARD_LIST
-            else:
-                list_ = LIST
-            type_ = f"{list_}[{type_}]" if type_ else list_
-        elif self.is_set:
-            if self.use_generic_container:
-                set_ = FROZEN_SET
-            elif self.use_standard_collections:
-                set_ = STANDARD_SET
-            else:
-                set_ = SET
-            type_ = f"{set_}[{type_}]" if type_ else set_
-        elif self.is_dict:
-            if self.use_generic_container:
-                dict_ = MAPPING
-            elif self.use_standard_collections:
-                dict_ = STANDARD_DICT
-            else:
-                dict_ = DICT
-            if self.dict_key or type_:
-                key = self.dict_key.type_hint if self.dict_key else STR
-                type_ = f"{dict_}[{key}, {type_ or ANY}]"
-            else:  # pragma: no cover
-                type_ = dict_
-        if self.is_optional and type_ != ANY:
-            return get_optional_type(type_, self.use_union_operator)
-        if self.is_func:
-            if self.kwargs:
-                kwargs: str = ", ".join(f"{k}={v}" for k, v in self.kwargs.items())
-                return f"{type_}({kwargs})"
-            return f"{type_}()"
-        return type_
+                t.is_optional = True
+
+        if t.is_list:
+            return self.determine_type_hint_composition_array(t, hint)
+
+        if t.is_set:
+            return self.determine_type_hint_composition_set(t, hint)
+
+        if t.is_dict:
+            return self.determine_type_hint_composition_map(t, hint)
+
+        if t.is_func:
+            return self.determine_type_hint_composition_function(t, hint)
+
+        return hint
+
+    def determine_type_hint_composition_array(
+        self,
+        t: DataType,
+        hint: str,
+        /,
+    ) -> str:
+        op = LIST
+        if t.use_generic_container:
+            op = SEQUENCE
+
+        elif t.use_standard_collections:
+            op = STANDARD_LIST
+
+        if hint:
+            return f"{op}[{hint}]"
+
+        return op
+
+    def determine_type_hint_composition_set(
+        self,
+        t: DataType,
+        hint: str,
+        /,
+    ) -> str:
+        op = SET
+        if t.use_generic_container:
+            op = FROZEN_SET
+
+        elif t.use_standard_collections:
+            op = STANDARD_SET
+
+        if hint:
+            return f"{op}[{hint}]"
+
+        return op
+
+    def determine_type_hint_composition_map(
+        self,
+        t: DataType,
+        hint: str,
+        /,
+    ) -> str:
+        op = DICT
+        if t.use_generic_container:
+            op = MAPPING
+
+        elif t.use_standard_collections:
+            op = STANDARD_DICT
+
+        if (type_key := t.dict_key) is not None:
+            hint_key = self.determine_type_hint(type_key)
+            return f"{op}[{hint_key}, {hint or ANY}]"
+
+        if hint:
+            hint_key = STR
+            return f"{op}[{hint_key}, {hint or ANY}]"
+
+        return op
+
+    def determine_type_hint_composition_function(
+        self,
+        t: DataType,
+        hint: str,
+        /,
+    ) -> str:
+        kwargs = t.kwargs or {}
+        kwargs_expr = ", ".join(f"{k}={v}" for k, v in kwargs.items())
+        return f"{hint}({kwargs_expr})"
 
     @property
     def is_union(self) -> bool:
